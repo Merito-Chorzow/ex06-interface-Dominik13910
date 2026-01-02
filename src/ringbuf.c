@@ -7,12 +7,12 @@ size_t rb_count(const rb_t* r){
 }
 
 size_t rb_free(const rb_t* r){
-    return RB_SIZE - 1 - rb_count(r); // jeden slot pusty dla rozróżnienia pełny/pusty
+    return RB_SIZE - 1 - rb_count(r); 
 }
 
 int rb_put(rb_t* r, uint8_t b){
     if (rb_free(r) == 0){
-        r->dropped++;                 // polityka: odrzucamy NOWE bajty
+        r->dropped++;                 
         return 0;
     }
     r->q[r->head % RB_SIZE] = b;

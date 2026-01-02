@@ -1,4 +1,3 @@
-# Makefile — wspólny szablon (C11 + debug)
 OS := $(shell uname -s)
 EXE :=
 ifeq ($(OS),Windows_NT)

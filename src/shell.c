@@ -1,83 +1,132 @@
 #include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
+#include <stdint.h>
 #include "shell.h"
 
-static void tx_str(shell_t* sh, const char* s){
-    while (*s) rb_put(&sh->tx, (uint8_t)*s++);
+typedef enum {
+    RX_IDLE,
+    RX_LEN,
+    RX_CMD,
+    RX_PAYLOAD,
+    RX_CRC
+} rx_state_t;
+
+static rx_state_t rx_state = RX_IDLE;
+static uint8_t rx_len;
+static uint8_t rx_cmd;
+static uint8_t rx_payload[8];
+static uint8_t rx_pos;
+static uint8_t rx_crc;
+
+static void tx_byte(shell_t* sh, uint8_t b){
+    rb_put(&sh->tx, b);
 }
 
-void shell_init(shell_t* sh){
-    rb_init(&sh->rx); rb_init(&sh->tx);
-    sh->setpoint = 0.0f;
-    sh->ticks = 0;
-    sh->broken_lines = 0;
-    tx_str(sh, "READY\r\n");
+static void send_ack(shell_t* sh){
+    tx_byte(sh, ACK);
 }
 
-void shell_rx_bytes(shell_t* sh, const char* s){
-    while (*s) {
-        if (!rb_put(&sh->rx, (uint8_t)*s++)) {
-            // overflow na RX — jeżeli odetnie linię, wykryjemy to w tick
+static void send_nack(shell_t* sh){
+    tx_byte(sh, NACK);
+}
+
+static void handle_frame(shell_t* sh){
+    switch ((cmd_t)rx_cmd){
+
+    case CMD_SET_SPEED:
+        if (rx_payload[0] <= 100){
+            sh->speed = rx_payload[0];
+            send_ack(sh);
+        } else {
+            send_nack(sh);
         }
+        break;
+
+    case CMD_STOP:
+        sh->speed = 0;
+        send_ack(sh);
+        break;
+
+    case CMD_GET_STAT:
+        tx_byte(sh, sh->rx.dropped);
+        tx_byte(sh, sh->broken_frames);
+        tx_byte(sh, sh->crc_errors);
+        send_ack(sh);
+        break;
+
+    default:
+        send_nack(sh);
+        break;
     }
 }
 
-static void process_line(shell_t* sh, const char* line){
-    if (strncmp(line,"set ",4)==0){
-        float v = strtof(line+4, NULL);
-        sh->setpoint = v;
-        char buf[64]; snprintf(buf,sizeof(buf),"OK set=%.3f\r\n", v);
-        tx_str(sh, buf);
-    } else if (strncmp(line,"get",3)==0){
-        char buf[96];
-        snprintf(buf,sizeof(buf),"set=%.3f ticks=%u drop=%zu broken=%u\r\n",
-            sh->setpoint, sh->ticks, sh->rx.dropped, sh->broken_lines);
-        tx_str(sh, buf);
-    } else if (strncmp(line,"stat",4)==0){
-        char buf[96];
-        snprintf(buf,sizeof(buf),"rx_free=%zu tx_free=%zu rx_count=%zu\r\n",
-            rb_free(&sh->rx), rb_free(&sh->tx), rb_count(&sh->rx));
-        tx_str(sh, buf);
-    } else if (strncmp(line,"echo ",5)==0){
-        tx_str(sh, "ECHO ");
-        tx_str(sh, line+5);
-        tx_str(sh, "\r\n");
-    } else {
-        tx_str(sh, "ERR\r\n");
+void shell_init(shell_t* sh){
+    rb_init(&sh->rx);
+    rb_init(&sh->tx);
+
+    sh->speed = 0;
+    sh->ticks = 0;
+    sh->broken_frames = 0;
+    sh->crc_errors = 0;
+
+    rx_state = RX_IDLE;
+}
+
+void shell_rx_bytes(shell_t* sh, const char* s){
+    while (*s){
+        rb_put(&sh->rx, (uint8_t)*s++);
     }
 }
 
 void shell_tick(shell_t* sh){
     sh->ticks++;
 
-    static char line[128];
-    static size_t n = 0;
     uint8_t b;
-    int saw_newline = 0;
 
     while (rb_get(&sh->rx, &b)){
-        if (b == '\n' || b == '\r'){
-            if (n > 0){
-                line[n] = 0;
-                process_line(sh, line);
-                n = 0;
-                saw_newline = 1;
+        switch (rx_state){
+
+        case RX_IDLE:
+            if (b == STX){
+                rx_state = RX_LEN;
+                rx_crc = 0;
             }
-        } else if (n + 1 < sizeof(line)){
-            line[n++] = (char)b;
-        } else {
-            // linia za długa → oznacz i wyczyść
-            sh->broken_lines++;
-            n = 0;
+            break;
+
+        case RX_LEN:
+            rx_len = b;
+            rx_pos = 0;
+            rx_crc ^= b;
+            rx_state = RX_CMD;
+            break;
+
+        case RX_CMD:
+            rx_cmd = b;
+            rx_crc ^= b;
+            rx_state = (rx_len > 1) ? RX_PAYLOAD : RX_CRC;
+            break;
+
+        case RX_PAYLOAD:
+            rx_payload[rx_pos++] = b;
+            rx_crc ^= b;
+            if (rx_pos == rx_len - 1)
+                rx_state = RX_CRC;
+            break;
+
+        case RX_CRC:
+            if (rx_crc == b){
+                handle_frame(sh);
+            } else {
+                sh->crc_errors++;
+                send_nack(sh);
+            }
+            rx_state = RX_IDLE;
+            break;
         }
     }
 
-    // heurystyka: jeśli był overflow (rx.dropped>0) i nie domknęliśmy linii,
-    // a w kolejnych tickach pojawia się początek nowej komendy — rośnie broken_lines.
-    (void)saw_newline;
+    /* TX */
+    while (rb_get(&sh->tx, &b)){
+       printf("0x%02X ", b);
 
-    // "wysyłka" — w urządzeniu byłby UART; tu wypisujemy na stdout
-    while (rb_get(&sh->tx, &b)) { putchar((char)b); }
+    }
 }
